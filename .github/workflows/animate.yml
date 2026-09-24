@@ -1,0 +1,79 @@
+name: Build 4K Video from Timestamped Images + Audio
+
+# Trigger manually from the Actions tab.
+# Assumes repo layout:
+#   img/0000.jpeg, img/0002.jpeg, ... (number in filename = start time in seconds)
+#   audio/audio.mp3
+on:
+  workflow_dispatch:
+
+jobs:
+  build-video:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Generate concat list with per-image durations
+        run: |
+          python3 << 'EOF'
+          import os, re, subprocess
+
+          img_dir = "img"
+          audio_path = "audio/audio.mp3"
+
+          files = sorted(
+              [f for f in os.listdir(img_dir) if f.lower().endswith((".jpg", ".jpeg", ".png"))],
+              key=lambda x: int(re.search(r'\d+', x).group())
+          )
+          if not files:
+              raise SystemExit("No image files found in img/")
+
+          timestamps = [int(re.search(r'\d+', f).group()) for f in files]
+
+          # get audio duration
+          result = subprocess.run(
+              ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+               "-of", "default=noprint_wrappers=1:nokey=1", audio_path],
+              capture_output=True, text=True, check=True
+          )
+          audio_duration = float(result.stdout.strip())
+
+          entries = []
+          for i, f in enumerate(files):
+              start = timestamps[i]
+              end = timestamps[i + 1] if i + 1 < len(files) else audio_duration
+              duration = max(end - start, 0.04)  # ffmpeg needs a positive duration
+              entries.append((f, duration))
+
+          with open("concat_list.txt", "w") as out:
+              for f, dur in entries:
+                  out.write(f"file '{os.path.join(img_dir, f)}'\n")
+                  out.write(f"duration {dur:.3f}\n")
+              # ffmpeg concat demuxer quirk: repeat the last file once more, no duration
+              out.write(f"file '{os.path.join(img_dir, entries[-1][0])}'\n")
+
+          print(f"Audio duration: {audio_duration:.3f}s")
+          print(f"Total images: {len(entries)}")
+          for f, d in entries:
+              print(f"  {f} -> {d:.3f}s")
+          EOF
+
+      - name: Build 4K video
+        run: |
+          ffmpeg -y -f concat -safe 0 -i concat_list.txt -i audio/audio.mp3 \
+            -vf "scale=3840:2160:force_original_aspect_ratio=decrease,pad=3840:2160:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p" \
+            -r 30 \
+            -c:v libx264 -preset slow -crf 16 -pix_fmt yuv420p \
+            -c:a aac -b:a 320k \
+            -shortest \
+            output_4k.mp4
+
+      - name: Upload video artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: final-4k-video
+          path: output_4k.mp4
